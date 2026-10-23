@@ -1,0 +1,131 @@
+#include <ESP32Servo.h>
+
+// ---------------------- กำหนดขา GPIO ----------------------
+const int RAIN_SENSOR_PIN = 34;   // ขา Analog Out ของ Raindrop Sensor (Input Only Pin)
+const int SERVO1_PIN      = 18;   // Servo ควบคุมราวตากผ้า
+const int SERVO2_PIN      = 19;   // Servo ควบคุมหลังคา
+
+// ---------------------- ค่า Threshold ----------------------
+const int RAIN_THRESHOLD = 3000;  // ค่า < 2000 = ฝนตก, ค่า >= 2000 = แห้ง/ฝนไม่ตก
+
+// ---------------------- มุมองศาที่ใช้งาน ----------------------
+const int ANGLE_MIN = 0;    // ตำแหน่ง "กางผ้า / เก็บหลังคา"ราวตากผ้า
+const int ANGLE_MAX = 90;  // ตำแหน่ง "เก็บผ้า / กางหลังคา"
+
+// ---------------------- ค่าหน่วงเวลาพักกระแสไฟระหว่าง Servo ----------------------
+const int POWER_REST_DELAY_MS = 1000; // delay พักระหว่างสั่ง Servo ตัวที่ 1 และ 2
+
+// ---------------------- ตัวแปร Servo Object ----------------------
+Servo servo1;  // Servo 1: ราวตากผ้า (GPIO 18)
+Servo servo2;  // Servo 2: หลังคา     (GPIO 19)
+
+// ---------------------- ตัวแปรเก็บสถานะปัจจุบัน ----------------------
+bool isRaining  = false;  // สถานะฝนล่าสุดที่ระบบทำงานตามไปแล้ว
+bool isFirstRun = true;   // บังคับให้ตั้งตำแหน่งเริ่มต้นครั้งแรกเสมอ
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("=== เริ่มต้นระบบตากผ้ารับมือฝนอัตโนมัติ ===");
+  Serial.println("โหมดหมุน: หมุนทันที (ไม่ค่อยๆ ขยับทีละองศา)");
+
+  // ---------------- ตั้งค่าขา Raindrop Sensor ----------------
+  pinMode(RAIN_SENSOR_PIN, INPUT);
+
+  // ---------------- จัดสรร PWM Timer และตั้งความถี่ก่อน attach ----------------
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  servo1.setPeriodHertz(50);
+  servo2.setPeriodHertz(50);
+
+  // ---------------- Attach Servo เข้ากับขาสัญญาณ (ทำครั้งเดียวตอน setup) ----------------
+  servo1.attach(SERVO1_PIN, 500, 2400); // pulse width min/max (us) ตามสเปค SG90
+  servo2.attach(SERVO2_PIN, 500, 2400);
+
+  // ==================================================================
+  // ระบบทดสอบมอเตอร์ (Self-Test) ตอนเปิดเครื่อง
+  // ==================================================================
+
+  // ---------------- ทดสอบ Servo 1 (ราวตากผ้า, GPIO 18) ----------------
+  Serial.println("[TEST] กำลังทดสอบ Servo 1 (G18)...");
+  servo1.write(ANGLE_MAX);   // หมุนไป 180 ทันที
+  delay(500);                // รอให้ Servo หมุนถึงตำแหน่งจริง (ใช้เวลาตามกลไก ไม่ใช่ step delay)
+  servo1.write(ANGLE_MIN);   // หมุนกลับ 0 ทันที
+  delay(500);
+  Serial.println("Servo 1 (G18) Ready");
+
+  // พักกระแสไฟ 1 วินาที ก่อนทดสอบตัวถัดไป
+  delay(1000);
+
+  // ---------------- ทดสอบ Servo 2 (หลังคา, GPIO 19) ----------------
+  Serial.println("[TEST] กำลังทดสอบ Servo 2 (G19)...");
+  servo2.write(ANGLE_MAX);   // หมุนไป 180 ทันที
+  delay(500);
+  servo2.write(ANGLE_MIN);   // หมุนกลับ 0 ทันที
+  delay(500);
+  Serial.println("Servo 2 (G19) Ready");
+
+  Serial.println("=== ทดสอบมอเตอร์เสร็จสิ้น: ทั้งสองตัวพร้อมใช้งาน ===");
+  Serial.println("ตำแหน่งเริ่มต้นของระบบ: ราวผ้ากางออก, หลังคาเก็บ (สถานะฝนไม่ตก)");
+  delay(500);
+}
+
+void loop() {
+  // ---------------- อ่านค่าจาก Raindrop Sensor ----------------
+  int rainValue = analogRead(RAIN_SENSOR_PIN); // ช่วงค่า 0 - 4095
+  bool rainDetectedNow = (rainValue < RAIN_THRESHOLD);
+
+  // ---------------- พิมพ์ค่า Debug ออก Serial Monitor ----------------
+  Serial.print("ค่าเซนเซอร์ฝน: ");
+  Serial.print(rainValue);
+  Serial.print(" | สถานะ: ");
+  Serial.println(rainDetectedNow ? "ฝนตก" : "แห้ง/ฝนไม่ตก");
+
+  // ---------------- ตรวจสอบการเปลี่ยนผ่านสถานะ ----------------
+  // สั่งงาน Servo เฉพาะตอนสถานะฝนเปลี่ยนไปจากเดิมเท่านั้น (กันหมุนซ้ำซาก)
+  if (rainDetectedNow != isRaining || isFirstRun) {
+
+    if (rainDetectedNow) {
+      // ============ กรณีฝนตก: เก็บผ้าก่อน แล้วค่อยกางหลังคา ============
+      Serial.println(">> ตรวจพบฝนตก: เริ่มลำดับการเก็บผ้าและกางหลังคา");
+
+      Serial.println("   ขั้นตอนที่ 1: Servo 1 เก็บราวตากผ้า (หมุนไป 180)...");
+      servo1.write(ANGLE_MAX);   // หมุนทันทีไปตำแหน่งเก็บผ้า
+      delay(500);                 // รอให้ Servo หมุนถึงตำแหน่งจริงก่อนสั่งตัวถัดไป
+
+      Serial.println("   พักกระแสไฟ 1 วินาที ก่อนสั่งงาน Servo ตัวถัดไป...");
+      delay(POWER_REST_DELAY_MS);
+
+      Serial.println("   ขั้นตอนที่ 2: Servo 2 กางหลังคา (หมุนไป 180)...");
+      servo2.write(ANGLE_MAX);   // หมุนทันทีไปตำแหน่งกางหลังคา
+      delay(500);
+
+      Serial.println(">> เสร็จสิ้น: เก็บผ้าและกางหลังคาป้องกันฝนเรียบร้อย");
+
+    } else {
+      // ============ กรณีฝนหยุด/แห้ง: เก็บหลังคาก่อน แล้วค่อยกางผ้า ============
+      Serial.println(">> ฝนหยุดตก/อากาศแห้ง: เริ่มลำดับการเก็บหลังคาและกางผ้า");
+
+      Serial.println("   ขั้นตอนที่ 1: Servo 2 เก็บหลังคา (หมุนไป 0)...");
+      servo2.write(ANGLE_MIN);   // หมุนทันทีไปตำแหน่งเก็บหลังคา
+      delay(500);
+
+      Serial.println("   พักกระแสไฟ 1 วินาที ก่อนสั่งงาน Servo ตัวถัดไป...");
+      delay(POWER_REST_DELAY_MS);
+
+      Serial.println("   ขั้นตอนที่ 2: Servo 1 กางราวตากผ้า (หมุนไป 0)...");
+      servo1.write(ANGLE_MIN);   // หมุนทันทีไปตำแหน่งกางผ้า
+      delay(500);
+
+      Serial.println(">> เสร็จสิ้น: เก็บหลังคาและกางผ้าออกตากต่อเรียบร้อย");
+    }
+
+    isRaining  = rainDetectedNow;
+    isFirstRun = false;
+  }
+
+  delay(500); // หน่วงก่อนอ่านค่าเซนเซอร์รอบถัดไป ลดการอ่านถี่เกินไป
+}
